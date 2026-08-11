@@ -21,8 +21,10 @@ declare -A PROTO_FLAG=([vless]="ev" [trojan]="et" [vmess]="mess")
 
 # ── 工具 ──────────────────────────────────────────────
 die()     { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
-ok()      { printf '\033[32m✓\033[0m %s\n' "$*"; }
-info()    { printf '\033[36m·\033[0m %s\n' "$*"; }
+# 状态提示一律走 stderr：有些函数用 stdout 返回 JSON（如 cf_relax_security），
+# 提示混进去会让调用方的 $(...) 拿到「提示+JSON」，jq --argjson 直接解析失败。
+ok()      { printf '\033[32m✓\033[0m %s\n' "$*" >&2; }
+info()    { printf '\033[36m·\033[0m %s\n' "$*" >&2; }
 need_cmd(){ command -v "$1" &>/dev/null || die "缺少依赖: $1"; }
 
 urlencode() {
@@ -692,6 +694,13 @@ do_install() {
     # 状态
     local dns_existed="false"
     [[ "$dns_before" != "null" ]] && dns_existed="true"
+    # jq --argjson 遇到空串会整体失败，导致 state.json 存不下来（存不下就没法改配置/卸载）。
+    # CF 接口任何一个返回空都不该拖垮状态保存，这里统一兜底成合法 JSON。
+    [[ -n "$dns_before" ]]          || dns_before="null"
+    [[ -n "$origin_rules_before" ]] || origin_rules_before="[]"
+    [[ -n "$security_backup" ]]     || security_backup="null"
+    [[ -n "$links_json" ]]          || links_json="{}"
+    [[ -n "$routes_json" ]]         || routes_json="[]"
     save_state "$(jq -n \
         --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg s "$short_id" --arg mode "$net_mode" \
         --argjson routes "$routes_json" \
