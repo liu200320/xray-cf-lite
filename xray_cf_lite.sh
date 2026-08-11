@@ -470,6 +470,45 @@ install_xray() {
 }
 
 # ── xray 配置生成 ─────────────────────────────────────
+# 外部工具（fanout 等）注入的出站/路由统一带这个前缀，重建配置时予以保留。
+EXTERNAL_TAG_PREFIX="fanout-"
+
+# external_outbounds 从现有配置里捞出外部注入的出站。没有配置或没有匹配项时返回 []。
+external_outbounds() {
+    [[ -f "$XRAY_CONFIG_PATH" ]] || { echo '[]'; return; }
+    jq --arg p "$EXTERNAL_TAG_PREFIX" \
+        '[.outbounds // [] | .[] | select((.tag // "") | startswith($p))]' \
+        "$XRAY_CONFIG_PATH" 2>/dev/null || echo '[]'
+}
+
+# external_routing_rules 捞出外部注入的分流规则，并把 inboundTag 重映射到新的入站 tag。
+#
+# 入站 tag 形如 in-<protocol>-<port>，改端口后 tag 会变，直接照搬旧规则会指向
+# 已不存在的 inboundTag（xray 不报错，规则静默失效）。这里按协议重新匹配：
+# 旧规则绑的是哪个协议，新配置里该协议的 tag 是什么，就替换成什么。
+external_routing_rules() {
+    local routes_json="$1"
+    [[ -f "$XRAY_CONFIG_PATH" ]] || { echo '[]'; return; }
+
+    # 协议 -> 新 tag 的映射
+    local proto_map
+    proto_map=$(echo "$routes_json" | jq '[.[] | {key:.protocol, value:("in-" + .protocol + "-" + (.listen_port|tostring))}] | from_entries')
+
+    # 旧 tag -> 协议（从旧配置的 inbounds 里读，tag 可能已过时但协议是准的）
+    local old_map
+    old_map=$(jq '[.inbounds // [] | .[] | {key:(.tag // ""), value:(.protocol // "")}] | from_entries' \
+        "$XRAY_CONFIG_PATH" 2>/dev/null) || { echo '[]'; return; }
+
+    jq --arg p "$EXTERNAL_TAG_PREFIX" --argjson pm "$proto_map" --argjson om "$old_map" '
+        [ .routing.rules // [] | .[]
+          | select((.outboundTag // "") | startswith($p))
+          | . as $rule
+          | ( [ (.inboundTag // [])[] | $om[.] // empty | $pm[.] // empty ] | unique ) as $newtags
+          | select($newtags | length > 0)
+          | $rule + {inboundTag: $newtags}
+        ]' "$XRAY_CONFIG_PATH" 2>/dev/null || echo '[]'
+}
+
 gen_xray_config() {
     local routes_json="$1" uid="$2"
     local inbounds
@@ -489,11 +528,18 @@ gen_xray_config() {
             sniffing: { enabled:true, destOverride:["http","tls"] }
         }
     ]')
-    jq -n --argjson inb "$inbounds" '{
+    # 保留外部工具（如 fanout）注入的出站与分流规则。
+    # 它们统一带 EXTERNAL_TAG_PREFIX 前缀，重新生成配置时原样带过来，
+    # 否则用户在这里改个 UUID 就会把已配好的出口绑定悄悄冲掉，流量默默回到直连。
+    local ext_outbounds ext_rules
+    ext_outbounds=$(external_outbounds)
+    ext_rules=$(external_routing_rules "$routes_json")
+
+    jq -n --argjson inb "$inbounds" --argjson eob "$ext_outbounds" --argjson erl "$ext_rules" '{
         log:{loglevel:"warning"},
         inbounds:$inb,
-        outbounds:[{tag:"direct",protocol:"freedom"},{tag:"block",protocol:"blackhole"}],
-        routing:{domainStrategy:"AsIs",rules:[{type:"field",outboundTag:"block",protocol:["bittorrent"]}]}
+        outbounds:([{tag:"direct",protocol:"freedom"},{tag:"block",protocol:"blackhole"}] + $eob),
+        routing:{domainStrategy:"AsIs",rules:([{type:"field",outboundTag:"block",protocol:["bittorrent"]}] + $erl)}
     }'
 }
 
