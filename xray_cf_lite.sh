@@ -27,6 +27,7 @@ ok()      { printf '\033[32m✓\033[0m %s\n' "$*" >&2; }
 info()    { printf '\033[36m·\033[0m %s\n' "$*" >&2; }
 need_cmd(){ command -v "$1" &>/dev/null || die "缺少依赖: $1"; }
 
+
 urlencode() {
     local s="$1" c
     local -i i
@@ -136,14 +137,45 @@ get_public_ip() {
     die "获取公网 IPv4 失败"
 }
 
+# detect_nat 猜测本机是直连公网还是在 NAT 后面。
+#
+# 只看「公网 IP 有没有绑在网卡上」会误判：云厂商（AWS/GCP/阿里云等）常用一对一 NAT，
+# 网卡上是内网地址，但公网端口其实直达。这类机器判成 NAT 会逼用户去填并不存在的端口映射。
+# 所以这里只作为默认建议，最终由用户确认（见 prompt_net_mode）。
 detect_nat() {
     local public_ip
     public_ip=$(get_public_ip)
-    if ip addr show 2>/dev/null | grep -q "inet ${public_ip}/"; then
+    if ip addr show 2>/dev/null | grep -qE "inet ${public_ip}/"; then
         echo "direct"
-    else
-        echo "nat"
+        return
     fi
+    echo "nat"
+}
+
+# prompt_net_mode 拿探测结果当默认值，让用户可以改。
+#
+# 探测不可能百分百准，判错了又没法改的话，装出来的配置就是错的（issue #1）。
+net_mode_label() {
+    [[ "$1" == "direct" ]] && echo "直连（公网端口直达本机）" || echo "NAT（需要端口映射）"
+}
+
+prompt_net_mode() {
+    local detected="$1" ans
+    echo >&2
+    info "网络环境探测结果: $(net_mode_label "$detected")" >&2
+    if [[ "$detected" == "nat" ]]; then
+        echo "  如果这台机器有独立公网 IP、外部能直接连到你要开的端口（常见于云厂商的一对一 NAT）," >&2
+        echo "  这里就该选直连，否则会让你填一堆并不存在的端口映射。" >&2
+    else
+        echo "  如果这台机器其实在 NAT/软路由后面，对外端口和本机监听端口不一致，这里要选 NAT。" >&2
+    fi
+    read -rp "使用哪种模式? (1=直连, 2=NAT, 回车=用探测结果): " ans
+    case "$ans" in
+        1) echo "direct" ;;
+        2) echo "nat" ;;
+        "") echo "$detected" ;;
+        *) die "无效选项: $ans" ;;
+    esac
 }
 
 get_listening_ports() {
@@ -616,8 +648,8 @@ do_install() {
     [[ -f "$XRAY_BINARY" ]] && ok "xray-core 已安装" || install_xray
 
     local net_mode
-    net_mode=$(detect_nat)
-    [[ "$net_mode" == "nat" ]] && info "检测到 NAT 环境（内网 IP）" || info "直连环境"
+    net_mode=$(prompt_net_mode "$(detect_nat)")
+    ok "网络模式: $(net_mode_label "$net_mode")"
 
     prompt_cf
 
@@ -918,13 +950,18 @@ do_update_ports() {
         echo
 
         local new_routes="$routes_json" idx=0
-        while IFS=$'\t' read -r proto old_cp; do
+        # 先把数据收进数组再循环：若用 `done < <(...)`，循环体的 stdin 会被数据流占用，
+        # 里面的交互 read 会吃掉下一行数据。
+        local rows=() row
+        mapfile -t rows < <(echo "$routes_json" | jq -r '.[] | [.protocol, (.cf_port|tostring)] | @tsv')
+        for row in "${rows[@]}"; do
+            local proto="${row%%$'\t'*}" old_cp="${row##*$'\t'}" ne
             read -rp "${proto} 新外部端口(当前=${old_cp}): " ne
             [[ -n "$ne" ]] || die "不能为空"
             [[ "$ne" =~ ^[0-9]+$ ]] || die "无效端口: $ne"
             new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((ne))" '.[$i].cf_port=$p')
             idx=$((idx+1))
-        done < <(echo "$routes_json" | jq -r '.[] | [.protocol, (.cf_port|tostring)] | @tsv')
+        done
 
         echo
         echo "更新预览:"
@@ -959,6 +996,72 @@ do_update_ports() {
 }
 
 # ── 7. 重启 xray ─────────────────────────────────────
+# ── 8. 切换网络模式 ──────────────────────────────────
+# 探测可能判错（issue #1），装完之后也得能改，否则只能卸载重装。
+do_switch_net_mode() {
+    local state; state=$(load_state 2>/dev/null || true)
+    [[ -n "$state" ]] || die "未检测到部署"
+
+    local domain zone_id uid cur routes_json
+    domain=$(echo "$state" | jq -r '.domain')
+    zone_id=$(echo "$state" | jq -r '.zone_id')
+    uid=$(echo "$state" | jq -r '.uuid')
+    cur=$(echo "$state" | jq -r '.net_mode // "direct"')
+    routes_json=$(echo "$state" | jq '.routes')
+
+    echo
+    echo "当前模式: $(net_mode_label "$cur")"
+    echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  外部:\(.cf_port)"'
+    echo
+
+    local target
+    if [[ "$cur" == "nat" ]]; then
+        target="direct"
+        echo "切成直连后，对外端口将与 xray 监听端口一致。"
+    else
+        target="nat"
+        echo "切成 NAT 后，需要为每个协议指定对外端口（路由器/宿主上映射到监听端口）。"
+    fi
+    read -rp "确认切换到 $(net_mode_label "$target")? (y/N): " c
+    [[ "${c,,}" =~ ^(y|yes)$ ]] || die "已取消"
+
+    local new_routes="$routes_json"
+    if [[ "$target" == "direct" ]]; then
+        # 直连下外部端口就是监听端口
+        new_routes=$(echo "$new_routes" | jq '[.[] | .cf_port = .listen_port]')
+    else
+        local idx=0
+        # 同上：先收进数组，别让数据流占住循环体的 stdin
+        local rows=() row
+        mapfile -t rows < <(echo "$routes_json" | jq -r '.[] | [.protocol, (.listen_port|tostring)] | @tsv')
+        for row in "${rows[@]}"; do
+            local proto="${row%%$'\t'*}" lp="${row##*$'\t'}" ep
+            read -rp "${proto} 对外端口(监听=${lp}, 回车=相同): " ep
+            [[ -n "$ep" ]] || ep="$lp"
+            [[ "$ep" =~ ^[0-9]+$ ]] || die "无效端口: $ep"
+            new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((ep))" '.[$i].cf_port=$p')
+            idx=$((idx+1))
+        done
+    fi
+
+    echo
+    echo "更新预览:"
+    echo "$new_routes" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  外部:\(.cf_port)"'
+    read -rp "确认? (Y/n): " confirm
+    [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
+
+    load_cf_account || die "未找到 CF 凭据"
+    apply_origin_rules "$zone_id" "$domain" "$new_routes"
+    ok "Origin Rules 已更新"
+
+    local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes")
+    save_links_snapshot "$domain" "$uid" "$links_json"
+    save_state "$(echo "$state" | jq --arg m "$target" --argjson r "$new_routes" --argjson l "$links_json" \
+        '.net_mode=$m | .routes=$r | .links=$l')"
+
+    echo; ok "已切换到 $(net_mode_label "$target")"; print_links "$links_json"
+}
+
 do_restart() {
     if ! svc_is_active; then
         echo "xray 当前未运行，正在启动..."
@@ -1003,14 +1106,15 @@ main() {
     echo "  5. 查看当前配置"
     echo "  6. 更新外部端口(NAT换端口)"
     echo "  7. 重启 xray"
+    echo "  8. 切换网络模式(直连/NAT)"
     [[ -n "$current_domain" ]] && echo "     (当前: $current_domain${net_mode:+ [$net_mode]})"
     echo
 
-    read -rp "请选择 [1-7]: " choice
+    read -rp "请选择 [1-8]: " choice
     case "$choice" in
         1) do_install ;; 2) do_uninstall ;; 3) do_show ;;
         4) do_modify ;; 5) do_show_config ;; 6) do_update_ports ;;
-        7) do_restart ;;
+        7) do_restart ;; 8) do_switch_net_mode ;;
         *) die "无效选项: $choice" ;;
     esac
 }
