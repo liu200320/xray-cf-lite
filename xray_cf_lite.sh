@@ -443,8 +443,10 @@ install_xray() {
 
     # 直接用 releases/latest/download 直链，不走 GitHub API（未认证 API 每 IP 每小时仅 60 次，
     # NAT 小鸡共享出口极易撞限流导致取版本号失败）。版本号仅用于日志显示，取不到不致命。
-    local ver
-    ver=$(curl -sf "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | jq -r '.tag_name' 2>/dev/null)
+    # 末尾 || true：脚本头部 set -euo pipefail，API 不可达时 curl 非 0 会经 pipefail
+    # 冒泡成命令替换失败并触发 set -e 提前退出，永远走不到下面的直链下载。
+    local ver=""
+    ver=$(curl -sf "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | jq -r '.tag_name' 2>/dev/null) || true
     [[ -n "$ver" && "$ver" != "null" ]] && info "xray $ver ($arch)" || info "xray latest ($arch)"
 
     local tmp="/tmp/xray-install-$$"
