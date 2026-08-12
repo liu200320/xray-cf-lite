@@ -441,13 +441,15 @@ install_xray() {
         *)             die "不支持的架构: $(uname -m)" ;;
     esac
 
+    # 直接用 releases/latest/download 直链，不走 GitHub API（未认证 API 每 IP 每小时仅 60 次，
+    # NAT 小鸡共享出口极易撞限流导致取版本号失败）。版本号仅用于日志显示，取不到不致命。
     local ver
-    ver=$(curl -sf "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r '.tag_name') || die "获取 xray 版本失败"
-    info "xray $ver ($arch)"
+    ver=$(curl -sf "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | jq -r '.tag_name' 2>/dev/null)
+    [[ -n "$ver" && "$ver" != "null" ]] && info "xray $ver ($arch)" || info "xray latest ($arch)"
 
     local tmp="/tmp/xray-install-$$"
     mkdir -p "$tmp"
-    curl -fsSL -o "$tmp/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/${ver}/Xray-linux-${arch}.zip" || die "下载失败"
+    curl -fsSL -o "$tmp/xray.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip" || die "下载失败"
 
     command -v unzip &>/dev/null || {
         command -v apk &>/dev/null && apk add --no-cache unzip
