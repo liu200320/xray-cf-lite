@@ -46,6 +46,7 @@
 不需要落盘，直接联网运行：
 
 ```bash
+apk add bash curl jq
 bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/xray-cf-lite/main/xray_cf_lite.sh)
 ```
 
